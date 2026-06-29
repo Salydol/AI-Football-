@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fie"
+version = "0.9.0"
+description = "Football Intelligence Engine — AI microservice for football analytics"
+requires-python = ">=3.12"
+dependencies = [
+    # CV + Tracking
+    "ultralytics>=8.3.0",
+    "supervision>=0.24.0",
+    "opencv-python>=4.10.0",
+    "numpy>=2.0.0",
+
+    # API
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "python-multipart>=0.0.12",
+
+    # Utils
+    "loguru>=0.7.0",
+    "scipy>=1.14.0",
+
+    # ML — Event Detection
+    "torch>=2.0.0",
+    "lightning>=2.0.0",
+    "requests>=2.28.0",
+
+    # Reports
+    "reportlab>=4.0.0",
+    "matplotlib>=3.9.0",
+
+    # ML — Match Prediction
+    "catboost>=1.2.0",
+
+    # LLM — Coach Assistant & Match Story
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+
+    # Video download
+    "yt-dlp>=2024.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["fie"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
