@@ -7,15 +7,18 @@ Usage:
     # Download data first (one-time):
     python scripts/download_statsbomb.py
 
-    # Train:
-    python -m fie.models.event_detection.train
+    # Precompute fast dataset (one-time, ~15 min for 500 matches):
+    python scripts/precompute_dataset.py --max-matches 500
 
-    # Train with custom settings:
+    # Train (fast, GPU-saturated):
     python -m fie.models.event_detection.train \
-        --data-dir data/statsbomb \
-        --epochs 30 \
-        --batch-size 64 \
-        --device cuda
+        --epochs 20 --batch-size 256 --device cuda \
+        --fast --num-workers 4 --precision bf16-mixed
+
+    # Train (original, no precompute needed):
+    python -m fie.models.event_detection.train \
+        --epochs 20 --batch-size 64 --device cuda \
+        --max-matches 100 --num-workers 0 --precision bf16-mixed
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,10 +41,10 @@ try:
 except ImportError:
     _HAS_LIGHTNING = False
 
-from fie.data.statsbomb import StatsBombEventDataset
+from fie.data.statsbomb import StatsBombEventDataset, StatsBombFastDataset
 from fie.models.event_detection.model import FootballTransformer, FootballTransformerConfig
 
-# Разрешить загрузку кастомных классов из чекпоинтов (PyTorch 2.6+)
+# Allow loading custom classes from checkpoints (PyTorch 2.6+)
 torch.serialization.add_safe_globals([FootballTransformerConfig])
 
 
@@ -175,6 +179,25 @@ def train_pytorch(
 # Main
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# SliceDataset — picklable train/val split for Windows multiprocessing
+# ---------------------------------------------------------------------------
+
+class _SliceDataset:
+    """Sequential slice of a dataset — pickles as 3 small values (no index list)."""
+    def __init__(self, dataset, start: int, end: int):
+        self.dataset = dataset
+        self.start = start
+        self.end = end
+
+    def __len__(self):
+        return self.end - self.start
+
+    def __getitem__(self, idx):
+        return self.dataset[self.start + idx]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Football Transformer")
     parser.add_argument("--data-dir", default="data/statsbomb")
@@ -186,8 +209,19 @@ def main() -> None:
     parser.add_argument("--max-matches", type=int, default=None)
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--precision", default="bf16-mixed",
+                        help="Precision: bf16-mixed (fastest on RTX), 16-mixed, 32")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile() — 10-20%% faster after warmup")
+    parser.add_argument("--cache", action="store_true",
+                        help="Cache dataset to .pt file (fast reload next run)")
     parser.add_argument("--resume", default=None,
-                        help="Путь к .ckpt файлу для продолжения обучения")
+                        help="Path to .ckpt file to resume training")
+    parser.add_argument("--fast", action="store_true",
+                        help="Use StatsBombFastDataset (memmap). "
+                             "Run scripts/precompute_dataset.py first.")
+    parser.add_argument("--memmap-dir", default="data/fast_cache",
+                        help="Directory with precomputed memmap files (default: data/fast_cache)")
     args = parser.parse_args()
 
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -195,37 +229,72 @@ def main() -> None:
 
     logger.info("Device: {}", args.device)
 
+    # Tensor Cores (RTX series) — faster matmul
+    if args.device == "cuda":
+        torch.set_float32_matmul_precision("medium")
+
     # --- Dataset ---
-    dataset = StatsBombEventDataset(
-        data_dir=args.data_dir,
-        max_matches=args.max_matches,
-    )
+    if args.fast:
+        logger.info("Using StatsBombFastDataset (memmap) from {}", args.memmap_dir)
+        dataset = StatsBombFastDataset(
+            cache_dir=args.memmap_dir,
+            augment=True,
+        )
+        logger.info("Tip: num-workers >= 4 recommended with --fast")
+    else:
+        cache_path = Path(args.data_dir) / f"cache_{args.max_matches or 'all'}.pt"
+        if args.cache and cache_path.exists():
+            logger.info("Loading cached dataset from {}", cache_path)
+            dataset = torch.load(cache_path, weights_only=False)
+        else:
+            dataset = StatsBombEventDataset(
+                data_dir=args.data_dir,
+                max_matches=args.max_matches,
+            )
+            if args.cache:
+                logger.info("Saving dataset cache to {}", cache_path)
+                torch.save(dataset, cache_path)
 
     val_size = int(len(dataset) * args.val_split)
     train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
+    if args.fast:
+        # Sequential split: pickle is tiny (no 4M index list) → num_workers works on Windows
+        train_ds = _SliceDataset(dataset, 0, train_size)
+        val_ds   = _SliceDataset(dataset, train_size, len(dataset))
+    else:
+        train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=args.device == "cuda",
+        pin_memory=(args.device == "cuda"),
+        persistent_workers=(args.num_workers > 0),
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        persistent_workers=(args.num_workers > 0),
     )
 
     logger.info("Train: {} | Val: {} samples", train_size, val_size)
 
     # --- Class weights (handle imbalance) ---
-    labels = [dataset.samples[i][1] for i in range(len(dataset))]
-    counts = torch.zeros(9)
-    for l in labels:
-        counts[l] += 1
+    if hasattr(dataset, "_labels"):
+        # StatsBombFastDataset — labels stored as numpy memmap, fast path
+        lbl_arr = np.array(dataset._labels)
+        counts = torch.zeros(9)
+        for c in range(9):
+            counts[c] = int((lbl_arr == c).sum())
+    else:
+        # StatsBombEventDataset — labels in .samples list
+        counts = torch.zeros(9)
+        for _, lbl in dataset.samples:
+            counts[lbl] += 1
     class_weights = (counts.sum() / (9 * counts.clamp(min=1))).float()
     logger.info("Class weights: {}", class_weights.tolist())
 
@@ -238,10 +307,20 @@ def main() -> None:
     # --- Train ---
     if _HAS_LIGHTNING:
         lit_model = FootballTransformerLit(config, lr=args.lr, class_weights=class_weights)
+
+        # torch.compile — 10-20% faster after warmup (requires PyTorch 2.0+)
+        if args.compile:
+            try:
+                lit_model.model = torch.compile(lit_model.model)
+                logger.info("torch.compile() enabled")
+            except Exception as e:
+                logger.warning("torch.compile() failed: {} — skipping", e)
+
         trainer = L.Trainer(
             max_epochs=args.epochs,
             accelerator=args.device,
             devices=1,
+            precision=args.precision,
             logger=CSVLogger(str(checkpoint_dir), name="events"),
             callbacks=[
                 ModelCheckpoint(
