@@ -22,6 +22,7 @@ from fie.api.routes import academy as academy_router
 from fie.api.routes import search as search_router
 from fie.api.routes import opponent as opponent_router
 from fie.api.routes import explainability as explainability_router
+from fie.api.routes import match_stats as match_stats_router
 
 
 @asynccontextmanager
@@ -65,8 +66,4 @@ app.include_router(academy_router.router)
 app.include_router(search_router.router)
 app.include_router(opponent_router.router)
 app.include_router(explainability_router.router)
-
-
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok", "version": "1.0.0"}
+app.include_router(match_stats_router.router)
